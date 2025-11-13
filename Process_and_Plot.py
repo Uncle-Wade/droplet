@@ -23,8 +23,11 @@ def main():
     start = 410
     end = 420
     min_pixels = 1  # minimum region area (in pixels)
-    PixelLength = 460 - 20  # scale bar length in pixels
-    nm_per_pixel = 1000 / PixelLength  # conversion factor (1 µm = 1000 nm)
+    PixelLength = 460  
+    # scale bar length in pixels. original code had 1um scalebar. we will go with 1cm physical scalebar
+    # we will measure the pixel amount of the scalebar nad record it above
+   
+    mm_per_pixel = 10 / PixelLength  # conversion factor (1 cm = 10 mm)
     output_csv = os.path.join(folder_path, "droplet_diameters_by_frame.csv")
     # ======================
 
@@ -53,21 +56,21 @@ def main():
 
         # === Measure labeled regions ===
         props = measure.regionprops(labeled)
-        diameters_nm = []
+        diameters_mm = []
 
         for region in props:
             if region.area > min_pixels:
-                diameter_nm = region.equivalent_diameter * nm_per_pixel
-                diameters_nm.append(diameter_nm)
+                diameter_mm = region.equivalent_diameter * mm_per_pixel
+                diameters_mm.append(diameter_mm)
 
-        diameters_nm.sort(reverse=True)  # optional: largest to smallest
+        diameters_mm.sort(reverse=True)  # optional: largest to smallest
 
-        if diameters_nm:
+        if diameters_mm:
             row_data = {"Frame_number": i}
-            for j, d in enumerate(diameters_nm, start=1):
+            for j, d in enumerate(diameters_mm, start=1):
                 row_data[f"Particle_{j}"] = d
             all_rows.append(row_data)
-            print(f"  -> {len(diameters_nm)} particles recorded")
+            print(f"  -> {len(diameters_mm)} particles recorded")
         else:
             all_rows.append({"Frame_number": i})
             print(f"  -> No regions found > {min_pixels}px")
@@ -145,7 +148,7 @@ def plot_3d_histogram(subfolder, csv_name="droplet_diameters_by_frame.csv", bin_
     ax = fig.add_subplot(111, projection='3d')
 
     surf = ax.plot_surface(X, Y, hist_matrix, cmap='viridis', edgecolor='none')
-    ax.set_xlabel("Droplet Diameter (nm)")
+    ax.set_xlabel("Droplet Diameter (mm)")
     ax.set_ylabel("Frame Number")
     ax.set_zlabel("Count")
     ax.set_title("Droplet Size Distribution Across Frames")
@@ -159,3 +162,4 @@ def plot_3d_histogram(subfolder, csv_name="droplet_diameters_by_frame.csv", bin_
 if __name__ == "__main__":
     main()
     plot_3d_histogram(subfolder="Test6_frames_tif_8bit")
+
