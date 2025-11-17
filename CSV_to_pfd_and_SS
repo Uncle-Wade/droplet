@@ -1,0 +1,349 @@
+# -*- coding: utf-8 -*-
+# analyze_droplet_pdfs.py
+# Created: 2025-11-16 (based on your earlier scripts)
+# Author: ChatGPT (adapted for your project)
+#
+# Usage: put this file in the same folder as your image-folder (or adjust subfolder path),
+# then run: python analyze_droplet_pdfs.py
+#
+# NOTE: If scipy is not installed, the script will fall back to histogram PDFs and a
+# sampled-quantile approximation of the Wasserstein distance.
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # registers 3D plotting
+
+# Try optional imports
+try:
+    from scipy.stats import gaussian_kde
+    from scipy.stats import entropy as _scipy_entropy  # used by JS fallback if needed
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+# ----------------------------
+# Utility distance functions
+# ----------------------------
+def jensen_shannon(P, Q, eps=1e-12):
+    """
+    Jensen-Shannon divergence between discrete distributions P and Q.
+    P and Q should be 1D arrays (not necessarily normalized).
+    Returns JS divergence (nats). Smaller = more similar. 
+    """
+    P = np.asarray(P, dtype=float)
+    Q = np.asarray(Q, dtype=float)
+    # handle NaNs / negatives
+    P = np.where(np.isfinite(P) & (P > 0), P, 0.0)
+    Q = np.where(np.isfinite(Q) & (Q > 0), Q, 0.0)
+
+    sP = P.sum()
+    sQ = Q.sum()
+    if sP == 0 and sQ == 0:
+        return 0.0
+    if sP > 0:
+        P = P / sP
+    else:
+        P = np.zeros_like(P)
+    if sQ > 0:
+        Q = Q / sQ
+    else:
+        Q = np.zeros_like(Q)
+
+    M = 0.5 * (P + Q)
+
+    # safe KL (only where a>0 and b>0)
+    def kl(a, b):
+        mask = (a > 0) & (b > 0)
+        return np.sum(a[mask] * np.log(a[mask] / b[mask]))
+
+    return 0.5 * (kl(P, M) + kl(Q, M))
+
+
+def wasserstein_1d_approx(samples_a, samples_b, n_quantiles=200):
+    """
+    Approximate 1D Wasserstein (Earth Mover's) distance between two sets of samples.
+    If scipy.stats.wasserstein_distance is available on the user's machine, you can
+    replace this with that exact function. This implementation uses quantile sampling
+    and approximates integral |F_a^{-1}(p) - F_b^{-1}(p)| dp.
+    """
+    a = np.asarray(samples_a, dtype=float)
+    b = np.asarray(samples_b, dtype=float)
+    if a.size == 0 and b.size == 0:
+        return 0.0
+    if a.size == 0:
+        # distance from empty to distribution -> integral of quantile(b)
+        qs = np.linspace(0.0, 1.0, n_quantiles)
+        qb = np.quantile(b, qs)
+        return np.mean(np.abs(qb))  # approximate
+    if b.size == 0:
+        qs = np.linspace(0.0, 1.0, n_quantiles)
+        qa = np.quantile(a, qs)
+        return np.mean(np.abs(qa))
+
+    qs = np.linspace(0.0, 1.0, n_quantiles)
+    qa = np.quantile(a, qs)
+    qb = np.quantile(b, qs)
+    return np.mean(np.abs(qa - qb))
+
+
+# ----------------------------
+# Main analysis function
+# ----------------------------
+def analyze_pdfs_from_csv(
+    subfolder,
+    csv_name="droplet_diameters_by_frame.csv",
+    use_kde=True,               # try to use KDE if scipy available
+    kde_bandwidth=None,         # None => scipy chooses; set float to force
+    bin_width=0.01,             # units: same as CSV (e.g., mm)
+    min_diameter=None,
+    max_diameter=None,
+    min_counts_for_frame=5,     # warn/flag frames with fewer droplets
+    js_moving_window=3,
+    js_tol=0.01,
+    js_consecutive=10,
+    plot_results=True
+):
+    """
+    Read CSV exported by your pipeline and:
+      - build per-frame PDFs (KDE or histogram)
+      - compute JS and approximate Wasserstein between consecutive frames
+      - detect steady-state (consecutive low JS)
+      - plot 3D PDF surface and JS/Wasserstein timeseries
+
+    Returns a dict with results and arrays for further analysis.
+    """
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    folder_path = os.path.join(base_dir, subfolder)
+    csv_path = os.path.join(folder_path, csv_name)
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    if "Frame_number" not in df.columns:
+        raise ValueError("CSV must contain a 'Frame_number' column.")
+
+    frames = df["Frame_number"].values
+    size_cols = df.drop(columns=["Frame_number"]).columns
+    size_data = df[size_cols].values  # shape: (n_frames, n_particles)
+    n_frames = size_data.shape[0]
+
+    # Flatten all samples to compute global bin range (after filtering)
+    all_sizes = size_data.flatten()
+    all_sizes = all_sizes[~np.isnan(all_sizes)]
+
+    if min_diameter is not None:
+        all_sizes = all_sizes[all_sizes >= min_diameter]
+    if max_diameter is not None:
+        all_sizes = all_sizes[all_sizes <= max_diameter]
+
+    if all_sizes.size == 0:
+        raise RuntimeError("No sizes left after applying min/max filters.")
+
+    dmin, dmax = np.min(all_sizes), np.max(all_sizes)
+    # small pad to ensure edges included
+    pad = 0.5 * bin_width
+    bins = np.arange(dmin - pad, dmax + bin_width + pad, bin_width)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    n_bins = len(bin_centers)
+
+    # Build per-frame PDFs
+    pdf_matrix = np.zeros((n_frames, n_bins))
+    total_counts = np.zeros(n_frames, dtype=int)
+    low_count_flags = np.zeros(n_frames, dtype=bool)
+
+    for i in range(n_frames):
+        row = size_data[i]
+        valid = row[~np.isnan(row)]
+        # apply min/max diameter filters
+        if min_diameter is not None:
+            valid = valid[valid >= min_diameter]
+        if max_diameter is not None:
+            valid = valid[valid <= max_diameter]
+
+        total_counts[i] = len(valid)
+        low_count_flags[i] = (len(valid) < min_counts_for_frame)
+
+        if len(valid) == 0:
+            pdf = np.zeros(n_bins)
+        else:
+            if use_kde and SCIPY_AVAILABLE:
+                try:
+                    kde = gaussian_kde(valid, bw_method=kde_bandwidth)
+                    vals = kde(bin_centers)
+                    # normalize so area = 1
+                    area = np.sum(vals) * bin_width
+                    pdf = vals / area if area > 0 else np.zeros_like(vals)
+                except Exception:
+                    # fallback to histogram if KDE fails for this frame
+                    counts, _ = np.histogram(valid, bins=bins)
+                    pdf = counts / (counts.sum() * bin_width) if counts.sum() > 0 else np.zeros_like(counts)
+            else:
+                counts, _ = np.histogram(valid, bins=bins)
+                pdf = counts / (counts.sum() * bin_width) if counts.sum() > 0 else np.zeros_like(counts)
+
+        pdf_matrix[i, :] = pdf
+
+    # Compute JS divergence and Wasserstein between consecutive frames
+    js_list = np.zeros(max(0, n_frames - 1))
+    ws_list = np.zeros_like(js_list)
+
+    for k in range(n_frames - 1):
+        P = pdf_matrix[k]
+        Q = pdf_matrix[k + 1]
+        js_list[k] = jensen_shannon(P, Q)
+        # For Wasserstein we prefer sample-wise distance; reconstruct samples from the raw CSV row:
+        samp_a = size_data[k][~np.isnan(size_data[k])]
+        samp_b = size_data[k + 1][~np.isnan(size_data[k + 1])]
+        # apply filters again for ws computation
+        if min_diameter is not None:
+            samp_a = samp_a[samp_a >= min_diameter]
+            samp_b = samp_b[samp_b >= min_diameter]
+        if max_diameter is not None:
+            samp_a = samp_a[samp_a <= max_diameter]
+            samp_b = samp_b[samp_b <= max_diameter]
+
+        # If scipy available and has wasserstein_distance, you could call it here.
+        ws_list[k] = wasserstein_1d_approx(samp_a, samp_b, n_quantiles=400)
+
+    # Smooth JS timeseries (moving average)
+    def moving_avg(x, w):
+        if x.size == 0 or w <= 1:
+            return x
+        kernel = np.ones(w) / w
+        return np.convolve(x, kernel, mode='same')
+
+    js_ma = moving_avg(js_list, js_moving_window)
+
+    # Detect steady state: find run of js_ma < js_tol of length js_consecutive
+    steady_start_idx = None
+    if js_ma.size > 0:
+        below = js_ma < js_tol
+        count = 0
+        for idx, val in enumerate(below):
+            if val:
+                count += 1
+                if count >= js_consecutive:
+                    steady_start_idx = idx - js_consecutive + 1
+                    break
+            else:
+                count = 0
+
+    # ----------------------------
+    # Plot results
+    # ----------------------------
+    if plot_results:
+        X, Y = np.meshgrid(bin_centers, frames)
+
+        fig = plt.figure(figsize=(14, 7))
+        ax = fig.add_subplot(121, projection='3d')
+        surf = ax.plot_surface(X, Y, pdf_matrix, cmap='viridis', edgecolor='none')
+        ax.set_xlabel("Diameter (units as in CSV)")
+        ax.set_ylabel("Frame number")
+        ax.set_zlabel("PDF (probability density)")
+        ax.set_title("Per-frame PDF surface (KDE if available)")
+        fig.colorbar(surf, ax=ax, shrink=0.5, label='PDF')
+
+        # mark low-count frames along y-axis
+        if low_count_flags.any():
+            low_frames = frames[low_count_flags]
+            # plot small red ticks at min bin center to indicate these frames
+            y_ticks = np.full_like(low_frames, np.min(bin_centers))
+            ax.scatter(y_ticks, low_frames, zs=0, zdir='z', s=20, c='r', label='low count frames')
+
+        # Right subplot: JS & Wasserstein time series + counts
+        ax2 = fig.add_subplot(122)
+        ax2.set_title("Similarity metrics between consecutive frames")
+        if js_list.size > 0:
+            ax2.plot(frames[:-1], js_list, label='JS (frame->frame)', alpha=0.6)
+            ax2.plot(frames[:-1], js_ma, label=f'MA(JS, w={js_moving_window})', linewidth=2)
+            ax2.set_xlabel("Frame")
+            ax2.set_ylabel("JS divergence (nats)")
+            ax2.axhline(js_tol, color='k', linestyle='--', label=f'tol={js_tol}')
+            if steady_start_idx is not None:
+                # steady_start_idx refers to index in js_ma; map to frame number where the run starts
+                steady_frame_est = frames[max(0, steady_start_idx)]
+                ax2.axvline(steady_frame_est, color='g', linestyle=':', label=f'steady start ≈ frame {steady_frame_est}')
+        else:
+            ax2.text(0.1, 0.5, "Not enough frames to compute JS", transform=ax2.transAxes)
+
+        ax2b = ax2.twinx()
+        ax2b.plot(frames, total_counts, color='tab:orange', alpha=0.6, label="total droplets")
+        ax2b.set_ylabel("Total droplets")
+        # combine legends
+        lines, labels = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2b.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc='upper right')
+
+        plt.tight_layout()
+        plt.show()
+
+    # Print a short summary
+    print("Frames processed:", n_frames)
+    print("Counts per frame: min, median, max =", int(total_counts.min()), int(np.median(total_counts)), int(total_counts.max()))
+    if steady_start_idx is not None:
+        print(f"Steady-state detected (JS moving-average) starting around frame {frames[max(0, steady_start_idx)]}")
+    else:
+        print("Steady-state NOT detected with current parameters.")
+
+    return {
+        "frames": frames,
+        "bin_centers": bin_centers,
+        "pdf_matrix": pdf_matrix,
+        "js_list": js_list,
+        "js_ma": js_ma,
+        "wasserstein": ws_list,
+        "total_counts": total_counts,
+        "low_count_flags": low_count_flags,
+        "steady_start_idx": steady_start_idx
+    }
+
+
+# ----------------------------
+# If executed as script
+# ----------------------------
+if __name__ == "__main__":
+    # === USER SETTINGS ===
+    subfolder = "Test6_frames_tif_8bit"     # folder (inside script dir) where CSV resides
+    csv_name = "droplet_diameters_by_frame.csv"
+
+    # Units are the same as stored in your CSV (you used mm in your modified script)
+    use_kde = True            # set False to force histogram-PDF
+    kde_bandwidth = None      # None => let gaussian_kde choose; set float for manual bandwidth
+    bin_width = 0.005         # 0.005 mm = 5 µm (tune to your data)
+    min_diameter = None       # e.g. 0.01 to filter tiny noise (units: mm)
+    max_diameter = 1.0        # filter large outliers (units: mm); set None to disable
+    min_counts_for_frame = 8
+    js_moving_window = 3
+    js_tol = 0.01
+    js_consecutive = 8
+
+    results = analyze_pdfs_from_csv(
+        subfolder=subfolder,
+        csv_name=csv_name,
+        use_kde=use_kde,
+        kde_bandwidth=kde_bandwidth,
+        bin_width=bin_width,
+        min_diameter=min_diameter,
+        max_diameter=max_diameter,
+        min_counts_for_frame=min_counts_for_frame,
+        js_moving_window=js_moving_window,
+        js_tol=js_tol,
+        js_consecutive=js_consecutive,
+        plot_results=True
+    )
+
+    # optional: save results to npz
+    out_npz = os.path.join(os.path.dirname(os.path.abspath(__file__)), subfolder, "pdf_analysis_results.npz")
+    np.savez(out_npz,
+             frames=results["frames"],
+             bin_centers=results["bin_centers"],
+             pdf_matrix=results["pdf_matrix"],
+             js_list=results["js_list"],
+             js_ma=results["js_ma"],
+             wasserstein=results["wasserstein"],
+             total_counts=results["total_counts"])
+    print("Saved analysis results to:", out_npz)
