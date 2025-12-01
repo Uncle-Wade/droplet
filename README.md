@@ -27,5 +27,6 @@ I (wade) need to:
 - [ ] integrate framerate into the software so that we can get particle speeds  
 - [ ] find a way to account for the sheet  
 - [ ] plot droplet distribution  
-- [ ] explore frame scaling to see if data can be enhanced with scalers (i think by scalers's nature this may be a fools errand)  
+- [ ] explore frame scaling to see if data can be enhanced with scalers (i think by scalers's nature this may be a fools errand)
+- [ ] add white point and black point adjustments so that lighting conditions can be accounted for.  
 - [ ] add a cool video/photo to the README so people like it better
