@@ -30,3 +30,7 @@ I (wade) need to:
 - [ ] explore frame scaling to see if data can be enhanced with scalers (i think by scalers's nature this may be a fools errand)
 - [ ] add white point and black point adjustments so that lighting conditions can be accounted for.  
 - [ ] add a cool video/photo to the README so people like it better
+- [ ] fix scalebar
+- [ ] plane charactateristics
+- [ ] try to anticipate the sheet when it's time for that
+- [ ] get the better camera in on this.
